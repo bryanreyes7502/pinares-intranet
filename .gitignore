@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+tmp_downloads/
+rio_error.png
+rio_ajax_error.txt
