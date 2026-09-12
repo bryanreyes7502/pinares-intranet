@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Descarga el Registro de Instrucciones de Operación (RIO) - Energía
-usando Chrome/Selenium, evitando la llamada HTTP directa a admin-ajax.php
-que puede devolver HTTP 403 desde GitHub Actions.
+Descarga el RIO de Energía del Coordinador Eléctrico Nacional.
 
-Salida:
+El botón "Descargar" del RIO actual dispara una petición AJAX desde el
+navegador. Por eso no dependemos de que Chrome cree físicamente un archivo:
+capturamos la respuesta de red de la petición que genera el botón y guardamos
+su contenido como CSV.
+
+Salida válida:
     data/data.json
 
-La fecha se calcula en hora de Chile (America/Santiago).
+Si la descarga falla, NO se modifica data/data.json.
 """
 
+import base64
 import csv
 import io
 import json
-import os
 import shutil
 import sys
 import time
@@ -24,8 +27,8 @@ from zoneinfo import ZoneInfo
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 RIO_URL = (
     "https://www.coordinador.cl/operacion/documentos/"
@@ -35,12 +38,11 @@ RIO_URL = (
 OUTPUT_PATH = Path("data/data.json")
 DOWNLOAD_DIR = Path("tmp_downloads")
 CHILE_TZ = ZoneInfo("America/Santiago")
-DOWNLOAD_TIMEOUT = 120
 PAGE_TIMEOUT = 45
+NETWORK_TIMEOUT = 90
 
 
 def create_driver(download_dir: Path) -> webdriver.Chrome:
-    """Crea Chrome headless configurado para descargas automáticas."""
     download_dir.mkdir(parents=True, exist_ok=True)
 
     options = Options()
@@ -56,6 +58,8 @@ def create_driver(download_dir: Path) -> webdriver.Chrome:
         "Chrome/153.0.0.0 Safari/537.36"
     )
 
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
     options.add_experimental_option(
         "prefs",
         {
@@ -68,7 +72,7 @@ def create_driver(download_dir: Path) -> webdriver.Chrome:
 
     driver = webdriver.Chrome(options=options)
 
-    # Permite descargas en headless Chrome.
+    # Permitir descargas en Chrome headless como respaldo.
     driver.execute_cdp_cmd(
         "Page.setDownloadBehavior",
         {
@@ -81,23 +85,21 @@ def create_driver(download_dir: Path) -> webdriver.Chrome:
 
 
 def set_input_value(driver, element, value: str) -> None:
-    """Establece un valor de input y dispara eventos para el JavaScript del sitio."""
     driver.execute_script(
         """
         const element = arguments[0];
         const value = arguments[1];
         const descriptor = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype,
-            'value'
+            window.HTMLInputElement.prototype, 'value'
         );
         if (descriptor && descriptor.set) {
             descriptor.set.call(element, value);
         } else {
             element.value = value;
         }
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-        element.dispatchEvent(new Event('blur', { bubbles: true }));
+        element.dispatchEvent(new Event('input', {bubbles: true}));
+        element.dispatchEvent(new Event('change', {bubbles: true}));
+        element.dispatchEvent(new Event('blur', {bubbles: true}));
         """,
         element,
         value,
@@ -105,15 +107,13 @@ def set_input_value(driver, element, value: str) -> None:
 
 
 def get_date_inputs(driver):
-    """Obtiene los inputs de fecha de la página en orden de aparición."""
     inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='date']")
     if len(inputs) >= 2:
         return inputs
 
-    # Respaldo: algunos cambios del sitio pueden eliminar type=date.
-    inputs = driver.find_elements(By.CSS_SELECTOR, "input")
-    date_like = []
-    for element in inputs:
+    candidates = driver.find_elements(By.CSS_SELECTOR, "input")
+    result = []
+    for element in candidates:
         attrs = " ".join(
             [
                 element.get_attribute("name") or "",
@@ -123,12 +123,11 @@ def get_date_inputs(driver):
             ]
         ).lower()
         if "fecha" in attrs or "date" in attrs:
-            date_like.append(element)
-    return date_like
+            result.append(element)
+    return result
 
 
 def set_energy_dates(driver, fecha: str) -> None:
-    """Configura fecha inicio y fecha término de Energía."""
     wait = WebDriverWait(driver, PAGE_TIMEOUT)
     wait.until(lambda d: len(get_date_inputs(d)) >= 2)
 
@@ -139,51 +138,46 @@ def set_energy_dates(driver, fecha: str) -> None:
     set_input_value(driver, date_inputs[0], fecha)
     set_input_value(driver, date_inputs[1], fecha)
 
-    # Hora 00:00:00 a 23:59:59. Seleccionamos por texto cuando existen selects.
+    # La página actual usa dos select para las horas de Energía.
     selects = driver.find_elements(By.CSS_SELECTOR, "select")
     if len(selects) >= 2:
         driver.execute_script(
             """
-            function selectFirstMatching(select, patterns, fallbackIndex) {
+            function pick(select, wanted, fallback) {
                 const options = Array.from(select.options);
-                let index = -1;
-                for (const pattern of patterns) {
-                    index = options.findIndex(o =>
-                        (o.text || '').trim().includes(pattern) ||
-                        (o.value || '').trim().includes(pattern)
-                    );
-                    if (index >= 0) break;
-                }
-                if (index < 0 && options.length > fallbackIndex) index = fallbackIndex;
-                if (index >= 0) {
-                    select.selectedIndex = index;
-                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                let idx = options.findIndex(o => {
+                    const text = (o.textContent || '').trim();
+                    const value = (o.value || '').trim();
+                    return wanted.some(x => text.includes(x) || value.includes(x));
+                });
+                if (idx < 0) idx = fallback;
+                if (idx >= 0 && idx < options.length) {
+                    select.selectedIndex = idx;
+                    select.dispatchEvent(new Event('change', {bubbles:true}));
                 }
             }
-            selectFirstMatching(arguments[0], ['00:00:00', '00:00'], 0);
-            selectFirstMatching(arguments[1], ['23:59:59', '23:59'], arguments[1].options.length - 1);
+            pick(arguments[0], ['00:00:00', '00:00'], 0);
+            pick(arguments[1], ['23:59:59', '23:59'], arguments[1].options.length - 1);
             """,
             selects[0],
             selects[1],
         )
 
-    time.sleep(2)
+    time.sleep(1.5)
 
 
 def find_energy_download_button(driver):
-    """Encuentra el primer enlace/botón Descargar, que corresponde a Energía."""
+    # El primer enlace/botón visible "Descargar" corresponde a Energía.
     candidates = driver.find_elements(By.XPATH, "//*[self::a or self::button]")
-
     for element in candidates:
         text = (element.text or "").strip().lower()
-        if text == "descargar" or "descargar" in text:
-            if element.is_displayed() and element.is_enabled():
-                return element
+        if text == "descargar" and element.is_displayed() and element.is_enabled():
+            return element
 
-    # Respaldo: buscar por clase/atributos conocidos o por href.
+    # Respaldo para cambios menores del DOM.
     candidates = driver.find_elements(
         By.CSS_SELECTOR,
-        "a[href*='export'], a.download-energia, a[class*='download'], button[class*='download']",
+        "a.download-energia, a[href*='export'], a[class*='download'], button[class*='download']",
     )
     for element in candidates:
         if element.is_displayed() and element.is_enabled():
@@ -192,51 +186,170 @@ def find_energy_download_button(driver):
     raise RuntimeError("No se encontró el botón 'Descargar' de Energía.")
 
 
-def wait_for_csv(download_dir: Path, before: set[Path]) -> Path:
-    """Espera hasta que Chrome termine de descargar un CSV."""
-    deadline = time.time() + DOWNLOAD_TIMEOUT
+def drain_performance_logs(driver):
+    try:
+        return driver.get_log("performance")
+    except Exception:
+        return []
 
+
+def capture_ajax_csv(driver, started_at: float, download_dir: Path) -> Path | None:
+    """
+    Busca en el tráfico de Chrome la respuesta generada por el botón.
+    Devuelve el CSV aunque la respuesta venga como Blob/fetch y Chrome no
+    genere un archivo físico.
+    """
+    requests = {}
+    responses = {}
+    completed = set()
+    seen_urls = []
+    deadline = time.time() + NETWORK_TIMEOUT
+
+    while time.time() < deadline:
+        for entry in drain_performance_logs(driver):
+            try:
+                message = json.loads(entry["message"])["message"]
+            except Exception:
+                continue
+
+            method = message.get("method")
+            params = message.get("params", {})
+
+            if method == "Network.requestWillBeSent":
+                request = params.get("request", {})
+                request_id = params.get("requestId")
+                url = request.get("url", "")
+                if request_id:
+                    requests[request_id] = {
+                        "url": url,
+                        "method": request.get("method", ""),
+                        "postData": request.get("postData"),
+                        "time": time.time(),
+                    }
+                    low = url.lower()
+                    if "admin-ajax.php" in low or "export_energia_csv" in low:
+                        if url not in seen_urls:
+                            seen_urls.append(url)
+                            print(f"Petición AJAX detectada: {url}")
+
+            elif method == "Network.responseReceived":
+                request_id = params.get("requestId")
+                response = params.get("response", {})
+                if request_id:
+                    responses[request_id] = response
+                    url = response.get("url", "").lower()
+                    if "admin-ajax.php" in url or "export_energia_csv" in url:
+                        status = response.get("status")
+                        content_type = response.get("mimeType", "")
+                        print(
+                            f"Respuesta AJAX: HTTP {status} | "
+                            f"Content-Type: {content_type} | URL {response.get('url', '')}"
+                        )
+
+            elif method == "Network.loadingFinished":
+                request_id = params.get("requestId")
+                if request_id:
+                    completed.add(request_id)
+
+        # Procesar respuestas candidatas completadas.
+        for request_id, response in list(responses.items()):
+            req = requests.get(request_id, {})
+            url = (response.get("url") or req.get("url") or "").lower()
+            status = response.get("status")
+            mime = (response.get("mimeType") or "").lower()
+
+            candidate = (
+                "admin-ajax.php" in url
+                or "export_energia_csv" in url
+                or "text/csv" in mime
+                or "application/csv" in mime
+                or "csv" in mime
+            )
+
+            if not candidate or request_id not in completed:
+                continue
+
+            try:
+                body = driver.execute_cdp_cmd(
+                    "Network.getResponseBody",
+                    {"requestId": request_id},
+                )
+            except Exception:
+                continue
+
+            body_text = body.get("body", "")
+            if body.get("base64Encoded"):
+                try:
+                    content = base64.b64decode(body_text)
+                except Exception:
+                    continue
+            else:
+                content = body_text.encode("utf-8", errors="replace")
+
+            # Si es HTTP 403/4xx, guardamos una copia para diagnóstico y no
+            # la confundimos con un CSV.
+            if status is not None and int(status) >= 400:
+                debug = Path("rio_ajax_error.txt")
+                debug.write_text(
+                    "STATUS: " + str(status) + "\n"
+                    + "URL: " + (response.get("url") or req.get("url") or "") + "\n"
+                    + "METHOD: " + str(req.get("method", "")) + "\n"
+                    + "POST DATA: " + str(req.get("postData")) + "\n\n"
+                    + content.decode("utf-8", errors="replace")[:20000],
+                    encoding="utf-8",
+                )
+                raise RuntimeError(
+                    f"El botón fue ejecutado, pero el endpoint respondió HTTP {status}. "
+                    "Se generó rio_ajax_error.txt para diagnóstico."
+                )
+
+            # Validar mínimamente que parece CSV y no HTML.
+            sample = content[:1000].lstrip().lower()
+            if b"<html" in sample or b"<!doctype" in sample:
+                continue
+
+            target = download_dir / f"rio_energia_{started_at:.0f}.csv"
+            target.write_bytes(content)
+            if target.stat().st_size > 0:
+                return target
+
+        time.sleep(0.5)
+
+    return None
+
+
+def wait_physical_csv(download_dir: Path, before: set[Path], timeout: int = 15) -> Path | None:
+    deadline = time.time() + timeout
     while time.time() < deadline:
         current = set(download_dir.iterdir())
         new_files = current - before
-
-        # Chrome usa .crdownload mientras la descarga está incompleta.
-        csv_files = [
+        candidates = [
             p for p in new_files
             if p.is_file() and p.suffix.lower() == ".csv"
         ]
-
-        if csv_files:
-            candidate = max(csv_files, key=lambda p: p.stat().st_mtime)
-
-            # Confirmamos que el archivo no sigue creciendo.
+        if candidates:
+            candidate = max(candidates, key=lambda p: p.stat().st_mtime)
             size1 = candidate.stat().st_size
             time.sleep(1)
-            size2 = candidate.stat().st_size
-            if size1 == size2 and size2 > 0:
+            if candidate.exists() and candidate.stat().st_size == size1 and size1 > 0:
                 return candidate
-
-        time.sleep(1)
-
-    raise TimeoutError(
-        f"No apareció el CSV descargado después de {DOWNLOAD_TIMEOUT} segundos."
-    )
+        time.sleep(0.5)
+    return None
 
 
 def download_rio(fecha: str) -> Path:
-    """Abre el RIO, configura hoy y pulsa Descargar."""
     if DOWNLOAD_DIR.exists():
         shutil.rmtree(DOWNLOAD_DIR)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     driver = create_driver(DOWNLOAD_DIR)
+    started_at = time.time()
 
     try:
         print(f"Abriendo: {RIO_URL}")
         driver.get(RIO_URL)
 
-        wait = WebDriverWait(driver, PAGE_TIMEOUT)
-        wait.until(
+        WebDriverWait(driver, PAGE_TIMEOUT).until(
             EC.presence_of_element_located(
                 (By.XPATH, "//*[contains(normalize-space(), 'Descargar Datos Energía')]")
             )
@@ -251,12 +364,23 @@ def download_rio(fecha: str) -> Path:
         print("Presionando 'Descargar'...")
         driver.execute_script("arguments[0].click();", button)
 
-        csv_path = wait_for_csv(DOWNLOAD_DIR, before)
-        print(f"CSV descargado: {csv_path}")
-        return csv_path
+        # Primero intentamos capturar la respuesta AJAX/Fetch.
+        csv_path = capture_ajax_csv(driver, started_at, DOWNLOAD_DIR)
+        if csv_path:
+            print(f"CSV obtenido desde la respuesta de red: {csv_path}")
+            return csv_path
+
+        # Respaldo: algunas versiones sí crean un archivo físico.
+        csv_path = wait_physical_csv(DOWNLOAD_DIR, before)
+        if csv_path:
+            print(f"CSV descargado físicamente: {csv_path}")
+            return csv_path
+
+        raise TimeoutError(
+            f"No se obtuvo CSV después de {NETWORK_TIMEOUT} segundos."
+        )
 
     except Exception:
-        # Capturamos screenshot para diagnóstico si algo cambia en la página.
         try:
             driver.save_screenshot("rio_error.png")
             print("Se generó rio_error.png para diagnóstico.", file=sys.stderr)
@@ -268,19 +392,15 @@ def download_rio(fecha: str) -> Path:
 
 
 def csv_to_rows(csv_text: str) -> list[dict]:
-    """Convierte el CSV a una lista de diccionarios."""
     csv_text = csv_text.lstrip("\ufeff")
     sample = csv_text[:4096]
     delimiter = ";" if sample.count(";") > sample.count(",") else ","
-
     reader = csv.DictReader(io.StringIO(csv_text), delimiter=delimiter)
     return list(reader)
 
 
 def read_csv_file(csv_path: Path) -> list[dict]:
-    """Lee el CSV con las codificaciones más habituales."""
     last_error = None
-
     for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
         try:
             text = csv_path.read_text(encoding=encoding)
@@ -289,23 +409,19 @@ def read_csv_file(csv_path: Path) -> list[dict]:
             return rows
         except Exception as exc:
             last_error = exc
-
     raise RuntimeError(f"No fue posible leer el CSV: {last_error}")
 
 
-def write_json(fecha: str, rows: list[dict], status: str, error_message: str | None) -> None:
-    """Escribe data/data.json."""
+def write_json(fecha: str, rows: list[dict]) -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-
     payload = {
         "fecha_consultada": fecha,
         "actualizado_en": datetime.now(CHILE_TZ).isoformat(),
-        "status": status,
-        "error": error_message,
+        "status": "ok",
+        "error": None,
         "total_registros": len(rows),
         "registros": rows,
     }
-
     with OUTPUT_PATH.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -323,18 +439,14 @@ def main() -> int:
     try:
         csv_path = download_rio(fecha)
         rows = read_csv_file(csv_path)
-
         if not rows:
-            raise RuntimeError("La descarga terminó pero el CSV no contiene registros.")
-
-        write_json(fecha, rows, "ok", None)
+            raise RuntimeError("La respuesta CSV no contiene registros.")
+        write_json(fecha, rows)
         print(f"JSON generado correctamente. Registros: {len(rows)}")
         return 0
-
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        # Importante: no tocamos data/data.json cuando la descarga falla.
-        # Así se conserva el último dato bueno.
+        # No modificar data/data.json si la descarga falla.
         return 1
 
 
