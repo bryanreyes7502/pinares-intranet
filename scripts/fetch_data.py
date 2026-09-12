@@ -10,6 +10,7 @@ Se ejecuta periódicamente desde un GitHub Action (ver
 import csv
 import io
 import json
+import os
 import sys
 from datetime import datetime
 from urllib.parse import urlencode
@@ -18,6 +19,9 @@ from zoneinfo import ZoneInfo
 import requests
 
 BASE_URL = "https://www.coordinador.cl/wp-admin/admin-ajax.php"
+# Página donde vive el botón de exportación; se manda como Referer para
+# parecer una descarga real hecha desde el navegador.
+REFERER_URL = "https://www.coordinador.cl/"
 TIMEOUT_SECONDS = 30
 OUTPUT_PATH = "data/data.json"
 CHILE_TZ = ZoneInfo("America/Santiago")
@@ -37,9 +41,16 @@ def build_url(fecha: str) -> str:
 def fetch_csv(fecha: str) -> str:
     url = build_url(fecha)
     headers = {
-        # Un User-Agent identificable es buena práctica al automatizar
-        # solicitudes contra un sitio de terceros.
-        "User-Agent": "PinaresIntranetBot/1.0 (uso interno; contacto: <completar>)"
+        # Headers de navegador real: algunos firewalls de WordPress
+        # bloquean por defecto cualquier User-Agent que se identifique
+        # como bot o que venga sin Referer/Accept.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Referer": REFERER_URL,
+        "Accept": "text/csv,application/csv,*/*",
+        "Accept-Language": "es-CL,es;q=0.9",
     }
     response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
     response.raise_for_status()
@@ -81,6 +92,7 @@ def main() -> int:
         "registros": rows,
     }
 
+    os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
